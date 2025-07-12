@@ -1,0 +1,496 @@
+%% Abordagem do Problema de Geolocalização de Buracos de Espectro para Acesso Dinâmico ao Espectro
+%% ROCs, SHG real e estimado
+%% Alfredo Jesus Arbolaez Fundora.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+clear variables; clc;
+close all;
+%rng(666);
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Parâmetros do sistema
+
+N1 =1600;              % Número de nós SSIoT na rede base.
+m = 1;
+G = 4;
+M = 10;
+L = 2;                 % Comprimento da área de cobertura quadrada centrada em (0,0).
+alpha = 0.3;           % Fração de SSIoTs fixos (alpha*N deve ser inteiro).
+n = 2400;              % Número de amostras por SU. Quando m=1, defina n igual ao número total de amostras no CSS.
+SNR = -5;              % Relação sinal-ruído média sobre todos os SSIoTs, em dB.
+runs = 1;              % Número de rodadas de sensoriamento para computar as CDFs empíricas.
+eta = 2.5;             % Expoente de perda de percurso.
+d0 = 0.001*L;          % Distância de referência para o cálculo da perda de percurso, em metros.
+P_tx = 5;              % Potência de transmissão do PU, em watts.
+xPU = 3*L;             % Coordenada x=y do transmissor PU, em metros. Quando distante dos SSIoTs => área de proteção grande para os PUs.
+Ns = 3*M;              % Número de amostras por símbolo QPSK do PU.
+rho = 0.5;             % Fração das variações de potência do ruído em torno da média.
+meanK = 1.88;          % Média do fator Rice (em dB) para K variável ao longo das rodadas e dos SSIoTs.
+sdK = 4.13;            % Desvio padrão (em dB) de K ao longo das rodadas e dos SSIoTs.
+randK = 1;             % Se randK = 1, K é aleatório; se randK = 0, K = meanK.
+PUsignal = 0;          % Sinal do PU: "0" = Gaussiano niid; "1" = QPSK niid (Ns>1) ou iid (Ns=1).
+Cc = 0.95;              % Coeficiente de correlação entre amostras vizinhas do sinal Gaussiano niid.
+sigma_s = 7;           % Desvio padrão do sombreamento, em dB.
+rows = 50;             % Número de linhas da matriz completa de sombreamento. Veja a função Shadowing_matrix.m.
+Lambda = 0.8*rows;     % Comprimento de correlação (Lambda > 0 é uma fração de 'rows').
+Npt = 100;             % Número de pontos nas ROC.
+SNR_th = SNR-7;          % Limiar de SNR (em dB) que define as áreas sombreadas.
+P_rx_th = -55;
+Pfa = 0.25;            % Pfa local alvo para o cálculo do limiar
+d_thresh = 4.25 / sqrt(N1 / (L^2));  % Umbral de distancia
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Seleção de Figuras (1 para mostrar, 0 para ocultar)
+Figures_to_show = [0,1,1,1,1]; % Figuras: [nodos, SHG real,decisiones finales, SHG estimado, matriz XOR]
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Valor Esperado de P(d) via integração numérica (instabilidade numérica pode ocorrer se o PU estiver dentro da área de cobertura)
+integrand = @(x, y) P_tx.*(sqrt((x - xPU).^2 + (y - xPU).^2)/d0).^-eta;
+E_Pd = integral2(integrand, -L/2, L/2, -L/2, L/2) / (L^2);
+
+%% Valor Esperado de P_rx
+E_10S10 = exp(((sigma_s^2)*log(10)^2)/200); % Valor esperado de 10^(S/10)
+E_Prx = E_Pd * E_10S10; % Valor esperado de P_rx (com sombreamento)
+
+%% Variância média do ruído, de acordo com o SNR
+if rho > 0
+    Sigma2_avg = (E_Prx*(log((1+rho)/(1-rho)))/(2*rho))/(10^(SNR/10)); % Sigma2_avg para 0 < rho < 1.
+else
+    Sigma2_avg = E_Prx/(10^(SNR/10)); % Sigma2_avg = 1 para rho = 0.
+end
+
+%% Pré-alocação de variáveis
+Tpride_h0 = zeros(runs,N1); 
+Tpride_h1 = zeros(runs,N1);
+snr = zeros(runs,N1); % Pré-alocação do vetor para armazenar as medidas de SNR
+
+Local_decisions_H1H0 = zeros(runs,N1); 
+Local_decisions_H1H1 = zeros(runs,N1);
+P_fa = zeros(Npt,N1); 
+P_d = zeros(Npt,N1);
+
+%% Distribuição aleatória de alpha*N nós fixos dentro da área de cobertura dos SSIoTs
+x1 = rand(1, alpha*N1)*L-L/2; 
+y1 = rand(1, alpha*N1)*L-L/2;
+%% Distribuição aleatória de (1-alpha)*N nós móveis dentro da área de cobertura dos SSIoTs
+x2 = [x1 , rand(1, N1-alpha*N1)*L-L/2]; 
+y2 = [y1 , rand(1, N1-alpha*N1)*L-L/2];
+
+%% Eventos de sensoriamento para todos os nós
+for run = 1:runs
+    fprintf('Ejecutando run %d de %d...\n', run, runs);
+    %% Valores de sombreamento para todos os pontos (rows^2) na área
+    Full_shadowing_matrix = Shadowing_matrix(rows, sigma_s, Lambda);
+
+    %% Distâncias do PU para todos os pontos (rows^2) na área
+    d_all = zeros(rows,rows); 
+    for j = 0:rows-1
+        for u = 0:rows-1
+            d_all(j+1,u+1) = norm([((j-rows/2)/(rows/2))*L/2, ((u-rows/2)/(rows/2))*L/2] - [xPU, xPU]); % Distâncias de (x,y) até (xPU,xPU)
+        end
+    end
+
+    %% Potência do sinal recebido para todos os pontos (rows^2) na área (usado para calcular os buracos de espectro reais)
+    P_rxdBm_all = 10*log10(10^3 * P_tx*(d0./d_all).^eta) + Full_shadowing_matrix; 
+    P_rx_all = 10^-3 * 10.^(P_rxdBm_all/10);
+    SNR_all = 10*log10(P_rx_all/Sigma2_avg);
+    actual_SHG = P_rxdBm_all < P_rx_th;
+
+
+    %% Loop para os nós
+    for nodos = 1:N1
+        %% Coordenadas dos SSIoTs para um nó
+        SSIoT = [x2(nodos), y2(nodos)];
+
+        %% Valores de sombreamento para os SSIoTs de um nó
+        Shadowing_values = Extract_shadowing_values(SSIoT, Full_shadowing_matrix, L/2);
+
+        %% Distâncias do PU aos SSIoTs de um nó
+        d_pu = norm(SSIoT - [xPU, xPU]);  % Apenas um escalar
+
+        %% Potências dos sinais recebidos pelos SSIoTs de um nó
+        P_rxdBm = 10*log10(10^3 * P_tx*(d0./d_pu).^eta) + Shadowing_values; 
+        P_rx = 10^-3 * 10.^(P_rxdBm/10);
+        g = sqrt(P_rx/P_tx); % Ganhos do canal dependentes da distância
+
+        %% Variâncias do ruído (m x 1) variáveis ao longo das rodadas de sensoriamento
+        U = unifrnd(-1, 1, m, 1); % RV uniforme em [-1,1].
+        Sigma2 = (1 + rho*U)*Sigma2_avg; % Variâncias do ruído nos SSIoTs
+
+        %% Vetor do canal (m x 1):
+        a = zeros(m,1);
+        for row = 1:m
+            if randK == 1
+                K = 10^((randn(1,1)*sdK+meanK)/10);
+            else
+                K = 10^(meanK/10); % K fixo
+            end
+            a(row,1) = (normrnd(sqrt(K/(2*(K+1))), sqrt((1-K/(K+1))/2), 1,1) + 1j*normrnd(sqrt(K/(2*(K+1))), sqrt((1-K/(K+1))/2), 1,1));
+        end
+        h = a.*g; % Redimensionar o vetor do canal de acordo com os ganhos acima
+
+        %% Matrizes de ruído Gaussiano (m x n):
+        W0 = zeros(m,n); 
+        W1 = zeros(m,n);
+        for j = 1:m
+            W0(j,:) = normrnd(0, sqrt(Sigma2(j)/2), 1, n) + 1j*normrnd(0, sqrt(Sigma2(j)/2), 1, n);
+            W1(j,:) = normrnd(0, sqrt(Sigma2(j)/2), 1, n) + 1j*normrnd(0, sqrt(Sigma2(j)/2), 1, n);
+        end
+
+        %% Sinal do PU (n x 1):
+        if PUsignal == 0
+            S = niid_Gaussian(n, P_tx, Cc); % Veja a função niid_Gaussian.m
+        elseif PUsignal == 1
+            numSymbols = ceil(n / Ns);
+            realPart = (randi([0, 1], 1, numSymbols) * 2 - 1) .* ones(Ns, numSymbols);
+            imagPart = (randi([0, 1], 1, numSymbols) * 2 - 1) .* ones(Ns, numSymbols);
+            S = realPart + 1j * imagPart;
+            S = S(:)'; % Achatar para um vetor linha
+            S = circshift(S, randi([0, Ns-1])); % Deslocamento circular aleatório
+            S = S(1:n) * sqrt(P_tx / 2); % Ajustar a potência
+        end
+
+        %% SNR medido em cada rodada para um nó
+        snr(run,nodos) = mean(sum(abs(h*S).^2,2)./sum(abs(W0).^2,2));
+
+        %% Matrizes de sinal recebido sob H0 e H1 (m x n)
+        X_h0 = W0; 
+        X_h1 = h*S + W1;
+
+        %% Matrizes de covariância amostral (SCM)
+        R_h0 = SCMc(X_h0,M); 
+        R_h1 = SCMc(X_h1,M); % Veja a função SCM.m
+
+        %% Estatística de teste PRIDe
+        x_h0 = R_h0(:); 
+        x_h1 = R_h1(:); 
+        m0 = mean(x_h0); 
+        m1 = mean(x_h1);
+        Tpride_h0(run,nodos) = sum(abs(x_h0))/sum(abs(x_h0 - m0));
+        Tpride_h1(run,nodos) = sum(abs(x_h1))/sum(abs(x_h1 - m1));
+    end % Fim dos nós
+    x = x2;  % Armazena as posições finais de todos os sensores
+    y = y2;
+end % Fim das rodadas (sensoriamento)
+
+%% CDFs empíricas da estatística PRIDe para todos os nós
+for nodos = 1:N1
+    u = 0; 
+    Th0 = Tpride_h0(:,nodos); 
+    Th1 = Tpride_h1(:,nodos);
+    Min = mean(Th0) - 3*std(Th0); 
+    Max = mean(Th1) + 1*std(Th1);
+    for i = Min:(Max-Min)/(Npt-1):Max
+        aux_h0 = 0; 
+        aux_h1 = 0; 
+        u = u+1;
+        for ii = 1:runs
+            if Th0(ii) < i
+                aux_h0 = aux_h0+1;
+            end
+            if Th1(ii) < i
+                aux_h1 = aux_h1+1;
+            end
+        end
+        CDF_Tpride_H0(u,nodos) = aux_h0/runs;
+        CDF_Tpride_H1(u,nodos) = aux_h1/runs;
+    end
+end
+
+%% Limiares de decisão dos nós e Pd para o Pfa alvo
+for nodos = 1:N1
+    Z = sort(Tpride_h0(:,nodos));
+   Gamma(nodos) = Z(round((1-Pfa)*runs)); % limiar de decisão
+    %Gamma(nodos) = prctile(Tpride_h0(:, nodos), 100*(1 - Pfa));
+
+    aux_h0 = 0; 
+    aux_h1 = 0;
+    for ii = 1:runs
+        if Tpride_h1(ii,nodos) >= Gamma(nodos)
+            aux_h1 = aux_h1 + 1;
+        end
+        if Tpride_h0(ii,nodos) >= Gamma(nodos)
+            aux_h0 = aux_h0 + 1;
+        end
+    end
+    Pdc(nodos) = aux_h1/runs; % Apenas para depuração (comparar com as ROCs dos nós para o Pfa local alvo)
+    Pfac(nodos) = aux_h0/runs; % Apenas para depuração (comparar com as ROCs dos nós para o Pfa local alvo)
+    % Decisões dos nós para H1|H0 com o limiar de decisão dado
+    Local_decisions_H1H0(:,nodos) = Tpride_h0(:,nodos) >= Gamma(nodos);
+    % Decisões dos nós para H1|H1 com o limiar de decisão dado
+    Local_decisions_H1H1(:,nodos) = Tpride_h1(:,nodos) >= Gamma(nodos);
+end
+
+%% Pfa e Pd locais a partir das CDFs empíricas
+for nodos = 1:N1
+    P_fa(:,nodos) = 1 - CDF_Tpride_H0(:,nodos);
+    P_d(:,nodos)  = 1 - CDF_Tpride_H1(:,nodos);
+end
+
+%% Avaliação global a partir das decisões individuais.
+% Supõe-se que Local_decisions_H1H0 e Local_decisions_H1H1 são matrizes de dimensão (runs x N1)
+global_Pfa = zeros(runs, 1);
+global_Pd  = zeros(runs, 1);
+for run = 1:runs
+    % Para cada rodada, calcula-se a porcentagem de sensores que tomam uma decisão de "detecção"
+    global_Pfa(run) = sum(Local_decisions_H1H0(run, :)) / N1;
+    global_Pd(run)  = sum(Local_decisions_H1H1(run, :)) / N1;
+end
+
+mean_global_Pfa = mean(global_Pfa);
+mean_global_Pd  = mean(global_Pd);
+
+disp(['Global Pfa (média): ', num2str(mean_global_Pfa)]);
+disp(['Global Pd (média): ', num2str(mean_global_Pd)]);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%  (instantâneo da última rodada)
+if Figures_to_show(1)
+    figure(1); clf;
+    % Sensores fixos (índices 1 a alpha*N1)
+    scatter(x1, y1, 36, 'filled', 'MarkerFaceColor', 'b');  
+    hold on;
+    % Sensores móveis (índices alpha*N1+1 a N1)
+    mobile_indices = (alpha*N1+1):N1;
+    scatter(y2(mobile_indices), x2(mobile_indices), 36, 'filled', 'MarkerFaceColor', 'r');  
+    xlabel('x');
+    ylabel('y');
+    title('Posições dos Sensores');
+    legend('Sensores fixos', 'Sensores móveis', 'Location', 'best');
+    axis([-L/2 L/2 -L/2 L/2]);  
+    axis square; grid on;
+    hold off;
+end
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+%% Plot dos SHGs reais em branco (instantâneo da última rodada)
+if Figures_to_show(2)
+    figure(2); hold on;
+    % Definir o intervalo e o passo
+    x_coords = linspace(-L/2, L/2, rows); % Coordenadas x para plotar
+    y_coords = linspace(-L/2, L/2, rows); % Coordenadas y para plotar
+    % Plotar a matriz com as coordenadas ajustadas
+    
+
+    imagesc(x_coords, y_coords, actual_SHG); % Mapear x e y para as coordenadas físicas
+    set(gca, 'YDir','normal'); % Corrige la dirección vertical
+
+    colormap(gca, [0.5 0.5 0.5; 1 1 1]); % Cinza para SNR >= SNR_th, branco para SNR < SNR_th
+    % Ajustar os eixos
+     title('SHG Real');
+    xlabel('\it{x}'); ylabel('\it{y}');
+    axis square; set(gca, 'Box', 'on')
+    xlim([-L/2, L/2]); % Definir limites para o eixo x
+    ylim([-L/2, L/2]); % Definir limites para o eixo y
+    % Adicionar ticks e rótulos
+    xticks(linspace(-L/2, L/2, 5)); % 5 ticks igualmente espaçados
+    yticks(linspace(-L/2, L/2, 5));
+    xticklabels(arrayfun(@num2str, linspace(-L/2, L/2, 5), 'UniformOutput', false));
+    yticklabels(arrayfun(@num2str, linspace(-L/2, L/2, 5), 'UniformOutput', false));
+    ax = gca; ax.Layer = 'top'; % Garantir que os eixos e ticks fiquem por cima
+    hold off;
+    f = gcf; % Obter a figura atual
+    currentPos = f.Position; % Obter a posição atual
+    f.Position = [currentPos(1), currentPos(2), 450, 400]; % Atualizar apenas a largura e altura
+    % folderPath = 'C:\Figures';
+    % fileName = 'actual_SHG.png';
+    % exportgraphics(gcf, fullfile(folderPath, fileName), 'Resolution', 600, 'ContentType', 'image');
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+sensor_detected_signal = logical(Local_decisions_H1H1(end, :));  % sin promedio
+if Figures_to_show(3)
+    figure(3); hold on;
+scatter(y(sensor_detected_signal), x(sensor_detected_signal), 36,  'r', 'filled'); hold on;
+scatter(y(~sensor_detected_signal), x(~sensor_detected_signal), 36, 'b', 'filled');
+
+legend('sim', 'Nao');
+title('Mapa de detección final de los sensores');
+xlabel('x'); ylabel('y');
+axis square; grid on;
+hold off;
+end
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Plot do SHG Estimado
+%% === SHG Estimado (Voronoi) con interpolación local y zonas grises para aislados ===
+if Figures_to_show(4)
+    figure(4); hold on;
+rect = polyshape([-L/2 L/2 L/2 -L/2], [-L/2 -L/2 L/2 L/2]);  % área rectangular de cobertura
+
+    % Coordenadas de los sensores
+    X = x(:);
+    Y = y(:);
+    decision_nodos = Local_decisions_H1H1(end, :); % Decisiones de la última ronda
+
+    % Voronoi
+    [V, C] = voronoin([X, Y]);
+
+    % Interpolación: buscar pares de nodos que no detectaron señal y están cerca
+    
+    marcar_blanco = false(length(X), 1);
+    idx_nodetect = find(decision_nodos == 0);
+
+    % === Detectar nodos aislados (sin vecinos no detectores cercanos) ===
+    nodos_aislados = false(length(X), 1);
+    for i = 1:length(idx_nodetect)
+        ni = idx_nodetect(i);
+        distancias = sqrt((X(ni) - X(idx_nodetect)).^2 + (Y(ni) - Y(idx_nodetect)).^2);
+        distancias(distancias == 0) = inf;
+        
+
+   %if all(distancias > d_thresh) 
+       if sum(distancias <= d_thresh) <= 2
+
+           nodos_aislados(ni) = true;
+        end
+    end
+    % === Interpolación por pares de no detectores ===
+    for i = 1:length(idx_nodetect)
+        for j = i+1:length(idx_nodetect)
+            ni = idx_nodetect(i); nj = idx_nodetect(j);
+            dist = hypot(X(ni) - X(nj), Y(ni) - Y(nj));
+           if dist <= d_thresh && ~nodos_aislados(ni) && ~nodos_aislados(nj)
+
+            %if dist <= d_thresh
+                x_min = min(X(ni), X(nj)); x_max = max(X(ni), X(nj));
+                y_min = min(Y(ni), Y(nj)); y_max = max(Y(ni), Y(nj));
+                en_rect = X >= x_min & X <= x_max & Y >= y_min & Y <= y_max;
+                marcar_blanco(en_rect) = true;
+            end
+        end
+    end
+
+   
+
+    % === Dibujar el Voronoi con colores apropiados ===
+    for i = 1:length(C)
+        if all(C{i} > 0)
+            vx = V(C{i}, 1); vy = V(C{i}, 2);
+            if any(isnan(vx)) || any(isnan(vy)) || any(isinf(vx)) || any(isinf(vy))
+                continue;
+            end
+          poly = polyshape(vx, vy);
+poly_clipped = intersect(poly, rect);
+if isempty(poly_clipped.Vertices)
+    continue;
+end
+
+vx_clip = poly_clipped.Vertices(:,1);
+vy_clip = poly_clipped.Vertices(:,2);
+
+if decision_nodos(i) == 1 && ~marcar_blanco(i)
+    fill(vy_clip, vx_clip, [0.5 0.5 0.5], 'EdgeColor', 'none');  % gris
+elseif nodos_aislados(i)
+    fill(vy_clip, vx_clip, [0.5 0.5 0.5], 'EdgeColor', 'none');  % gris
+else
+    fill(vy_clip, vx_clip, [1 1 1], 'EdgeColor', 'none');        % blanco
+end
+
+
+        end
+    end
+
+    xlim([-L/2, L/2]);
+    ylim([-L/2, L/2]);
+    axis square;
+    grid on;
+    xlabel('x'); ylabel('y');
+    xticks(linspace(-L/2, L/2, 5)); % 5 ticks igualmente espaçados
+    yticks(linspace(-L/2, L/2, 5));
+    xticklabels(arrayfun(@num2str, linspace(-L/2, L/2, 5), 'UniformOutput', false));
+    yticklabels(arrayfun(@num2str, linspace(-L/2, L/2, 5), 'UniformOutput', false));
+    ax = gca; ax.Layer = 'top'; % Garantir que os eixos e ticks fiquem por cima
+    title('SHG Estimado con Voronoi e interpolacion');
+    hold off;
+
+    %% === Crear matriz D_voronoi_interp ===
+    D_voronoi_interp = zeros(rows);
+    x_grid = linspace(-L/2, L/2, rows);
+    y_grid = linspace(-L/2, L/2, rows);
+    [YY, XX] = meshgrid(y_grid, x_grid);  % y primero, luego x
+    rect = polyshape([-L/2 L/2 L/2 -L/2], [-L/2 -L/2 L/2 L/2]);
+
+    for i = 1:length(C)
+        if all(C{i} > 0)
+            vx = V(C{i}, 1); vy = V(C{i}, 2);
+            if any(isnan(vx)) || any(isinf(vx)) || any(isnan(vy)) || any(isinf(vy))
+                continue;
+            end
+            poly = polyshape(vx, vy);
+            poly_clipped = intersect(poly, rect);
+            if isempty(poly_clipped.Vertices)
+                continue;
+            end
+
+            valor = 1; % blanco por defecto
+           if decision_nodos(i) == 1 && ~marcar_blanco(i)
+            valor = 0;
+            elseif nodos_aislados(i)
+                valor = 1; % gris claro
+           
+            end
+
+            in_vec = isinterior(poly_clipped, XX(:), YY(:));
+            in = reshape(in_vec, size(XX));
+            D_voronoi_interp(in) = valor;
+        end
+    end
+end
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+ 
+
+%% === XOR entre SHG real e estimado por Voronoi ===
+if Figures_to_show(5)
+    xor_voronoi = not(xor(D_voronoi_interp, actual_SHG));
+    figure (5);
+    imagesc(x_grid, y_grid, flipud(xor_voronoi));
+    colormap(gca, [0.5 0.5 0.5; 1 1 1]);  % Gris = error, blanco = acierto
+    axis square; axis tight;
+    xlabel('\it{x}'); ylabel('\it{y}');
+    title('XOR entre SHG Real y SHG Voronoi con Interpolación');
+end
+
+%% === Mostrar tasa de acierto ===
+acierto_voronoi = mean(xor_voronoi(:)) * 100;
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+%% Exibir o SNR medido, Pd global e Pfa global
+% Calcular o SNR global médio (através da média de todos os sensores em todas as rodadas)
+mean_SNR_dB = 10*log10(mean(snr(:)));
+
+% Avaliação global baseada nas decisões individuais (já calculadas nos blocos anteriores)
+% Supõe-se que 'Local_decisions_H1H0' e 'Local_decisions_H1H1' têm dimensões (runs x N1)
+global_Pfa = zeros(runs, 1);
+global_Pd  = zeros(runs, 1);
+for run = 1:runs
+    % Para cada rodada, calcula-se a média das decisões de todos os sensores:
+    global_Pfa(run) = sum(Local_decisions_H1H0(run, :)) / N1;
+    global_Pd(run)  = sum(Local_decisions_H1H1(run, :)) / N1;
+end
+
+mean_global_Pfa = mean(global_Pfa);
+mean_global_Pd  = mean(global_Pd);
+
+disp(['SNR medido (médio): ', num2str(mean_SNR_dB), ' dB']);
+disp(['Global Pfa (média individual): ', num2str(mean_global_Pfa)]);
+disp(['Global Pd (média individual): ', num2str(mean_global_Pd)]);
+
+% Se além disso foram calculados Pfac e Pdc individualmente no bloco de limiares,
+% também podem ser exibidos:
+disp(['Pfa local (por sensor): ', num2str(Pfac)]);
+disp(['Pd local (por sensor): ', num2str(Pdc)]);
+disp(['Tasa de acierto SHG Voronoi Interpolado: ', num2str(acierto_voronoi), ' %']);
+disp(['Media Tpride H0: ', num2str(mean(Tpride_h0(:)))]);
+disp(['Media Tpride H1: ', num2str(mean(Tpride_h1(:)))]);
